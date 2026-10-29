@@ -845,27 +845,27 @@ func readTopic(client *sarama.Client, admin *sarama.ClusterAdmin, name string, r
 	// read partitions in parallel
 	for _, p := range ps {
 
-		go func(partitionID int32) {
+		go func(partitionId int32) {
 			var (
 				err error
 				led *sarama.Broker
 			)
 
-			np := Partition{ID: partitionID}
+			np := Partition{ID: partitionId}
 
 			if requestedFields.partitionOffset {
-				if np.OldestOffset, err = (*client).GetOffset(name, partitionID, sarama.OffsetOldest); err != nil {
-					output.Warnf("unable to read oldest offset for topic %s partition %d", name, partitionID)
+				if np.OldestOffset, err = (*client).GetOffset(name, partitionId, sarama.OffsetOldest); err != nil {
+					output.Warnf("unable to read oldest offset for topic %s partition %d", name, partitionId)
 				}
 
-				if np.NewestOffset, err = (*client).GetOffset(name, partitionID, sarama.OffsetNewest); err != nil {
-					output.Warnf("unable to read newest offset for topic %s partition %d", name, partitionID)
+				if np.NewestOffset, err = (*client).GetOffset(name, partitionId, sarama.OffsetNewest); err != nil {
+					output.Warnf("unable to read newest offset for topic %s partition %d", name, partitionId)
 				}
 			}
 
 			if requestedFields.partitionLeader {
-				if led, err = (*client).Leader(name, partitionID); err != nil {
-					output.Warnf("unable to read leader for topic %s partition %d", name, partitionID)
+				if led, err = (*client).Leader(name, partitionId); err != nil {
+					output.Warnf("unable to read leader for topic %s partition %d", name, partitionId)
 					np.Leader = "none"
 				} else {
 					np.Leader = led.Addr()
@@ -873,16 +873,16 @@ func readTopic(client *sarama.Client, admin *sarama.ClusterAdmin, name string, r
 			}
 
 			if requestedFields.partitionReplicas {
-				if np.Replicas, err = (*client).Replicas(name, partitionID); err != nil {
-					output.Warnf("unable to read replicas for topic %s partition %d", name, partitionID)
+				if np.Replicas, err = (*client).Replicas(name, partitionId); err != nil {
+					output.Warnf("unable to read replicas for topic %s partition %d", name, partitionId)
 				} else {
 					sort.Slice(np.Replicas, func(i, j int) bool { return np.Replicas[i] < np.Replicas[j] })
 				}
 			}
 
 			if requestedFields.partitionISRs {
-				if np.ISRs, err = (*client).InSyncReplicas(name, partitionID); err != nil {
-					output.Warnf("unable to read inSyncReplicas for topic %s partition %d", name, partitionID)
+				if np.ISRs, err = (*client).InSyncReplicas(name, partitionId); err != nil {
+					output.Warnf("unable to read inSyncReplicas for topic %s partition %d", name, partitionId)
 				} else {
 					sort.Slice(np.ISRs, func(i, j int) bool { return np.ISRs[i] < np.ISRs[j] })
 				}
