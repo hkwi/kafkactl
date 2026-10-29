@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Open lazily discovered broker connections before checking availability for topic replication-factor changes.
-- Avoid unnecessary config requests and misleading zero replication factors in topic listings; propagate read failures and remove shared state between partition readers.
+- Avoid unnecessary config requests and misleading zero replication factors in topic listings; preserve usable metadata on config or replica-availability errors, warn and skip unreadable topics, and bound concurrent readers.
+- Refresh partition metadata before changing replication factor when partitions are added in the same command.
 
 ### Added
 - [#337](https://github.com/deviceinsight/kafkactl/issues/337) Support decoding/encoding Avro messages without a schema registry, via `--avro-schema-file` (`produce`/`consume`) and `--avro-schema-header` (`consume`, opt-in, e.g. `ce_dataschema` for CloudEvents-style per-message schema URIs), including CloudEvents in structured content mode with the JSON event format

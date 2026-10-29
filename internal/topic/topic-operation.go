@@ -369,6 +369,11 @@ func (operation *Operation) AlterTopic(topic string, flags AlterTopicFlags) erro
 				return errors.Errorf("Could not create partitions for topic '%s': %v", topic, err)
 			}
 			output.Infof("partitions have been created")
+			if flags.ReplicationFactor > 0 {
+				if t, err = readTopicAfterPartitionChange(&client, &admin, topic, flags.Partitions); err != nil {
+					return errors.Wrap(err, "failed to refresh topic after creating partitions")
+				}
+			}
 		}
 	}
 
@@ -667,10 +672,7 @@ func (operation *Operation) GetTopics(flags GetTopicsFlags) error {
 		return errors.Errorf("unknown outputFormat: %s", flags.OutputFormat)
 	}
 
-	topicList, err := readTopics(&client, &admin, topics, requestedFields)
-	if err != nil {
-		return err
-	}
+	topicList := readTopics(&client, &admin, topics, requestedFields)
 
 	switch flags.OutputFormat {
 	case "json", "yaml":

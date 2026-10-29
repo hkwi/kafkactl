@@ -2,7 +2,6 @@ package topic
 
 import (
 	"errors"
-	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -79,7 +78,7 @@ func TestReadTopicWithoutConfigs(t *testing.T) {
 	}
 }
 
-func TestReadTopicsPropagatesErrors(t *testing.T) {
+func TestReadTopicPropagatesUnusableReadErrors(t *testing.T) {
 	syntheticError := errors.New("synthetic read failure")
 	for _, failure := range []string{"partitions", "replicas", "configs"} {
 		t.Run(failure, func(t *testing.T) {
@@ -96,12 +95,9 @@ func TestReadTopicsPropagatesErrors(t *testing.T) {
 			}
 			var client sarama.Client = readClient
 			var admin sarama.ClusterAdmin = configAdmin
-			topics, err := readTopics(&client, &admin, []string{"example-events", "example-metrics"}, fields)
-			if !errors.Is(err, syntheticError) || !strings.Contains(err.Error(), "example-") {
-				t.Fatalf("expected contextual read error, got topics=%v, err=%v", topics, err)
-			}
-			if topics != nil {
-				t.Fatalf("failed reads must not be displayed as successful topics: %v", topics)
+			_, err := readTopic(&client, &admin, "example-events", fields)
+			if !errors.Is(err, syntheticError) {
+				t.Fatalf("expected read error, got %v", err)
 			}
 		})
 	}
@@ -128,10 +124,7 @@ func TestReadTopicsSuccessfulResultsAreSorted(t *testing.T) {
 	var client sarama.Client = &topicReadClient{partitionCount: 1}
 	var admin sarama.ClusterAdmin = &topicConfigAdmin{}
 	fields := requestedTopicFields{partitionID: true, partitionReplicas: true, config: NoConfigs}
-	topics, err := readTopics(&client, &admin, []string{"example-z", "example-a"}, fields)
-	if err != nil {
-		t.Fatal(err)
-	}
+	topics := readTopics(&client, &admin, []string{"example-z", "example-a"}, fields)
 	if len(topics) != 2 || topics[0].Name != "example-a" || topics[1].Name != "example-z" {
 		t.Fatalf("unexpected topic order: %v", topics)
 	}

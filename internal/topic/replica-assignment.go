@@ -12,7 +12,7 @@ import (
 func availableReplicaBrokers(client sarama.Client) []*sarama.Broker {
 	var allBrokers = client.Brokers()
 
-	var availableBrokers []*sarama.Broker
+	var openedBrokers []*sarama.Broker
 	for _, broker := range allBrokers {
 		// Brokers discovered in metadata are connected lazily. Connected alone
 		// reports local connection state, not whether a broker is reachable.
@@ -20,6 +20,13 @@ func availableReplicaBrokers(client sarama.Client) []*sarama.Broker {
 			output.Warnf("unable to open broker %d (%s): %v", broker.ID(), broker.Addr(), err)
 			continue
 		}
+		openedBrokers = append(openedBrokers, broker)
+	}
+
+	// Open starts dialing asynchronously. Start every dial before waiting so
+	// multiple unreachable brokers do not each add a full dial timeout.
+	var availableBrokers []*sarama.Broker
+	for _, broker := range openedBrokers {
 		connected, err := broker.Connected()
 		if err != nil {
 			output.Warnf("unable to connect to broker %d (%s): %v", broker.ID(), broker.Addr(), err)
