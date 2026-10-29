@@ -331,6 +331,7 @@ func (operation *Operation) AlterTopic(topic string, flags AlterTopicFlags) erro
 	if client, err = internal.CreateClient(&context); err != nil {
 		return errors.Wrap(err, "failed to create client")
 	}
+	defer func() { _ = client.Close() }()
 
 	if exists, err = internal.TopicExists(&client, topic); err != nil {
 		return errors.Wrap(err, "failed to read topics")
@@ -343,6 +344,7 @@ func (operation *Operation) AlterTopic(topic string, flags AlterTopicFlags) erro
 	if admin, err = internal.CreateClusterAdmin(&context); err != nil {
 		return errors.Wrap(err, "failed to create cluster admin")
 	}
+	defer func() { _ = admin.Close() }()
 
 	if t, err = readTopic(&client, &admin, topic, allFields); err != nil {
 		return errors.Wrap(err, "failed to read topic")
@@ -372,21 +374,7 @@ func (operation *Operation) AlterTopic(topic string, flags AlterTopicFlags) erro
 
 	if flags.ReplicationFactor > 0 {
 
-		var allBrokers = client.Brokers()
-
-		var availableBrokers []*sarama.Broker
-		for _, broker := range allBrokers {
-			connected, err := broker.Connected()
-			if err != nil {
-				output.Debugf("error checking broker %d connectivity: %v", broker.ID(), err)
-				continue
-			}
-			if connected {
-				availableBrokers = append(availableBrokers, broker)
-			} else {
-				output.Warnf("broker %d (%s) is not available and will be excluded from replica assignment", broker.ID(), broker.Addr())
-			}
-		}
+		availableBrokers := availableReplicaBrokers(client)
 
 		if len(availableBrokers) == 0 {
 			return errors.Errorf("no available brokers found for topic '%s'", topic)
@@ -439,8 +427,8 @@ func (operation *Operation) AlterTopic(topic string, flags AlterTopicFlags) erro
 
 			partitions := make([]int32, len(t.Partitions))
 
-			for _, p := range t.Partitions {
-				partitions[0] = p.ID
+			for i, p := range t.Partitions {
+				partitions[i] = p.ID
 			}
 
 			const maxReassignmentWait = 10 * time.Minute
@@ -629,71 +617,6 @@ func (operation *Operation) CloneTopic(sourceTopic, targetTopic string) error {
 	return nil
 }
 
-func getTargetReplicas(currentReplicas []int32, brokerReplicaCount map[int32]int, targetReplicationFactor int16) ([]int32, error) {
-
-	replicas := currentReplicas
-
-	for len(replicas) > int(targetReplicationFactor) {
-
-		sort.Slice(replicas, func(i, j int) bool {
-			brokerI := replicas[i]
-			brokerJ := replicas[j]
-			_, availableI := brokerReplicaCount[brokerI]
-			_, availableJ := brokerReplicaCount[brokerJ]
-
-			// Unavailable brokers (not in brokerReplicaCount) should be sorted to the end
-			// so they are removed first when decreasing replication factor
-			if availableI != availableJ {
-				return availableI
-			}
-			return brokerReplicaCount[brokerI] < brokerReplicaCount[brokerJ] || (brokerReplicaCount[brokerI] == brokerReplicaCount[brokerJ] && brokerI < brokerJ)
-		})
-
-		lastReplica := replicas[len(replicas)-1]
-		replicas = replicas[:len(replicas)-1]
-		if _, ok := brokerReplicaCount[lastReplica]; ok {
-			brokerReplicaCount[lastReplica]--
-		}
-	}
-
-	// Strip unavailable replicas so the increase phase replaces them with available brokers.
-	var availableReplicas []int32
-	for _, r := range replicas {
-		if _, ok := brokerReplicaCount[r]; ok {
-			availableReplicas = append(availableReplicas, r)
-		}
-	}
-	replicas = availableReplicas
-
-	var unusedBrokerIDs []int32
-
-	if len(replicas) < int(targetReplicationFactor) {
-		for brokerID := range brokerReplicaCount {
-			if !util.ContainsInt32(replicas, brokerID) {
-				unusedBrokerIDs = append(unusedBrokerIDs, brokerID)
-			}
-		}
-		if len(unusedBrokerIDs) < (int(targetReplicationFactor) - len(replicas)) {
-			return nil, errors.New("not enough brokers")
-		}
-	}
-
-	for len(replicas) < int(targetReplicationFactor) {
-
-		sort.Slice(unusedBrokerIDs, func(i, j int) bool {
-			brokerI := unusedBrokerIDs[i]
-			brokerJ := unusedBrokerIDs[j]
-			return brokerReplicaCount[brokerI] < brokerReplicaCount[brokerJ] || (brokerReplicaCount[brokerI] == brokerReplicaCount[brokerJ] && brokerI > brokerJ)
-		})
-
-		replicas = append(replicas, unusedBrokerIDs[0])
-		brokerReplicaCount[unusedBrokerIDs[0]]++
-		unusedBrokerIDs = unusedBrokerIDs[1:]
-	}
-
-	return replicas, nil
-}
-
 func (operation *Operation) GetTopics(flags GetTopicsFlags) error {
 
 	var (
@@ -711,10 +634,12 @@ func (operation *Operation) GetTopics(flags GetTopicsFlags) error {
 	if admin, err = internal.CreateClusterAdmin(&context); err != nil {
 		return errors.Wrap(err, "failed to create cluster admin")
 	}
+	defer func() { _ = admin.Close() }()
 
 	if client, err = internal.CreateClient(&context); err != nil {
 		return errors.Wrap(err, "failed to create client")
 	}
+	defer func() { _ = client.Close() }()
 
 	if topics, err = client.Topics(); err != nil {
 		return errors.Wrap(err, "failed to read topics")
@@ -742,33 +667,10 @@ func (operation *Operation) GetTopics(flags GetTopicsFlags) error {
 		return errors.Errorf("unknown outputFormat: %s", flags.OutputFormat)
 	}
 
-	topicChannel := make(chan Topic)
-	errChannel := make(chan error)
-
-	// read topics in parallel
-	for _, topic := range topics {
-		go func(topic string) {
-			t, err := readTopic(&client, &admin, topic, requestedFields)
-			if err != nil {
-				output.Debugf("failed to read topic %q: %v", topic, err)
-			}
-			topicChannel <- t
-		}(topic)
+	topicList, err := readTopics(&client, &admin, topics, requestedFields)
+	if err != nil {
+		return err
 	}
-
-	topicList := make([]Topic, 0, len(topics))
-	for range topics {
-		select {
-		case topic := <-topicChannel:
-			topicList = append(topicList, topic)
-		case err := <-errChannel:
-			return err
-		}
-	}
-
-	sort.Slice(topicList, func(i, j int) bool {
-		return topicList[i].Name < topicList[j].Name
-	})
 
 	switch flags.OutputFormat {
 	case "json", "yaml":
@@ -825,96 +727,6 @@ func (operation *Operation) DeleteRecords(topic string, flags DeleteRecordsFlags
 	return admin.DeleteRecords(topic, offsets)
 }
 
-func readTopic(client *sarama.Client, admin *sarama.ClusterAdmin, name string, requestedFields requestedTopicFields) (Topic, error) {
-	var (
-		err error
-		ps  []int32
-		led *sarama.Broker
-		top = Topic{Name: name}
-	)
-
-	if !requestedFields.partitionID {
-		return top, nil
-	}
-
-	if ps, err = (*client).Partitions(name); err != nil {
-		return top, err
-	}
-
-	partitionChannel := make(chan Partition)
-
-	// read partitions in parallel
-	for _, p := range ps {
-
-		go func(partitionId int32) {
-
-			np := Partition{ID: partitionId}
-
-			if requestedFields.partitionOffset {
-				if np.OldestOffset, err = (*client).GetOffset(name, partitionId, sarama.OffsetOldest); err != nil {
-					output.Warnf("unable to read oldest offset for topic %s partition %d", name, partitionId)
-				}
-
-				if np.NewestOffset, err = (*client).GetOffset(name, partitionId, sarama.OffsetNewest); err != nil {
-					output.Warnf("unable to read newest offset for topic %s partition %d", name, partitionId)
-				}
-			}
-
-			if requestedFields.partitionLeader {
-				if led, err = (*client).Leader(name, partitionId); err != nil {
-					output.Warnf("unable to read leader for topic %s partition %d", name, partitionId)
-					np.Leader = "none"
-				} else {
-					np.Leader = led.Addr()
-				}
-			}
-
-			if requestedFields.partitionReplicas {
-				if np.Replicas, err = (*client).Replicas(name, partitionId); err != nil {
-					output.Warnf("unable to read replicas for topic %s partition %d", name, partitionId)
-				} else {
-					sort.Slice(np.Replicas, func(i, j int) bool { return np.Replicas[i] < np.Replicas[j] })
-				}
-			}
-
-			if requestedFields.partitionISRs {
-				if np.ISRs, err = (*client).InSyncReplicas(name, partitionId); err != nil {
-					output.Warnf("unable to read inSyncReplicas for topic %s partition %d", name, partitionId)
-				} else {
-					sort.Slice(np.ISRs, func(i, j int) bool { return np.ISRs[i] < np.ISRs[j] })
-				}
-			}
-
-			partitionChannel <- np
-		}(p)
-	}
-
-	for range ps {
-		partition := <-partitionChannel
-		top.Partitions = append(top.Partitions, partition)
-	}
-
-	sort.Slice(top.Partitions, func(i, j int) bool {
-		return top.Partitions[i].ID < top.Partitions[j].ID
-	})
-
-	if requestedFields.config != NoConfigs {
-
-		topicConfig := sarama.ConfigResource{
-			Type: sarama.TopicResource,
-			Name: name,
-		}
-
-		if top.Configs, err = internal.ListConfigs(admin, topicConfig, requestedFields.config == AllConfigs); err != nil {
-			return top, err
-		}
-	}
-
-	top.ReplicationFactor = replicationFactor(top)
-
-	return top, nil
-}
-
 func getConfigString(configs []internal.Config) string {
 
 	var configStrings []string
@@ -924,18 +736,6 @@ func getConfigString(configs []internal.Config) string {
 	}
 
 	return strings.Trim(strings.Join(configStrings, ","), "[]")
-}
-
-// replicationFactor for topic calculated as minimal replication factor across partitions.
-func replicationFactor(t Topic) int {
-	var factor int
-	for _, partition := range t.Partitions {
-		if len(partition.Replicas) < factor || factor == 0 {
-			factor = len(partition.Replicas)
-		}
-	}
-
-	return factor
 }
 
 func CompleteTopicNames(_ *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
