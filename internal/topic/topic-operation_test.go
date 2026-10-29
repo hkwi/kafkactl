@@ -1,7 +1,11 @@
 package topic
 
 import (
+	"errors"
+	"fmt"
 	"testing"
+
+	"github.com/IBM/sarama"
 )
 
 func TestGetTargetReplicasDecrease(t *testing.T) {
@@ -165,5 +169,118 @@ func TestGetTargetReplicasNotEnoughBrokers(t *testing.T) {
 	}
 	if err.Error() != "not enough brokers" {
 		t.Fatalf("expected 'not enough brokers' error, got: %v", err)
+	}
+}
+
+type topicReadClient struct {
+	sarama.Client
+	partitionCount int
+	replicasErr    error
+}
+
+func (c *topicReadClient) Partitions(string) ([]int32, error) {
+	partitions := make([]int32, c.partitionCount)
+	for i := range partitions {
+		partitions[i] = int32(i)
+	}
+	return partitions, nil
+}
+
+func (c *topicReadClient) Replicas(string, int32) ([]int32, error) {
+	return []int32{1, 2, 3}, c.replicasErr
+}
+
+func (c *topicReadClient) InSyncReplicas(string, int32) ([]int32, error) {
+	return []int32{1, 2, 3}, nil
+}
+
+func (c *topicReadClient) GetOffset(_ string, partition int32, _ int64) (int64, error) {
+	return int64(partition) + 42, nil
+}
+
+func (c *topicReadClient) Leader(_ string, partition int32) (*sarama.Broker, error) {
+	return sarama.NewBroker(fmt.Sprintf("broker-%d.example:9092", partition)), nil
+}
+
+type topicConfigAdmin struct {
+	sarama.ClusterAdmin
+	err   error
+	calls int
+}
+
+func (a *topicConfigAdmin) DescribeConfigs(resources []*sarama.ConfigResource, _ sarama.DescribeConfigsOptions) ([]*sarama.ConfigResourceResult, error) {
+	a.calls++
+	if a.err != nil {
+		return nil, a.err
+	}
+	results := make([]*sarama.ConfigResourceResult, len(resources))
+	for i, resource := range resources {
+		results[i] = &sarama.ConfigResourceResult{Type: resource.Type, Name: resource.Name}
+	}
+	return results, nil
+}
+
+func TestReadTopicConfigsPreserveReplicationFactor(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config PrintConfigsParam
+		denied bool
+		calls  int
+	}{
+		{name: "default", denied: true},
+		{name: "none", config: NoConfigs, denied: true},
+		{name: "non-default", config: NonDefaultConfigs, calls: 1},
+		{name: "all", config: AllConfigs, calls: 1},
+		{name: "non-default denied", config: NonDefaultConfigs, denied: true, calls: 1},
+		{name: "all denied", config: AllConfigs, denied: true, calls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var client sarama.Client = &topicReadClient{partitionCount: 1}
+			configAdmin := &topicConfigAdmin{}
+			if tc.denied {
+				configAdmin.err = sarama.ErrTopicAuthorizationFailed
+			}
+			var admin sarama.ClusterAdmin = configAdmin
+			fields := requestedTopicFields{partitionID: true, partitionReplicas: true, config: tc.config}
+			topic, err := readTopic(&client, &admin, "example-events", fields)
+			if tc.denied && tc.calls != 0 {
+				if !errors.Is(err, sarama.ErrTopicAuthorizationFailed) {
+					t.Fatalf("expected config authorization error, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if topic.ReplicationFactor != 3 || configAdmin.calls != tc.calls {
+				t.Fatalf("RF=%d, config requests=%d; want RF=3, requests=%d", topic.ReplicationFactor, configAdmin.calls, tc.calls)
+			}
+		})
+	}
+}
+
+func TestReadTopicPreservesUnavailableReplicaIDs(t *testing.T) {
+	var client sarama.Client = &topicReadClient{partitionCount: 1, replicasErr: sarama.ErrReplicaNotAvailable}
+	var admin sarama.ClusterAdmin = &topicConfigAdmin{}
+	fields := requestedTopicFields{partitionID: true, partitionReplicas: true, config: NoConfigs}
+	topic, err := readTopic(&client, &admin, "example-events", fields)
+	if err != nil || topic.ReplicationFactor != 3 || len(topic.Partitions[0].Replicas) != 3 {
+		t.Fatalf("assigned replica IDs must survive an unavailable broker: topic=%+v, err=%v", topic, err)
+	}
+}
+
+func TestReadTopicConcurrentPartitions(t *testing.T) {
+	var client sarama.Client = &topicReadClient{partitionCount: 32}
+	var admin sarama.ClusterAdmin = &topicConfigAdmin{}
+	topic, err := readTopic(&client, &admin, "example-events", allFields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topic.ReplicationFactor != 3 || len(topic.Partitions) != 32 {
+		t.Fatalf("unexpected topic metadata: %+v", topic)
+	}
+	for i, partition := range topic.Partitions {
+		if partition.ID != int32(i) || partition.Leader != fmt.Sprintf("broker-%d.example:9092", i) ||
+			partition.OldestOffset != int64(i)+42 || partition.NewestOffset != int64(i)+42 {
+			t.Fatalf("partition metadata mixed between concurrent reads: %+v", partition)
+		}
 	}
 }
